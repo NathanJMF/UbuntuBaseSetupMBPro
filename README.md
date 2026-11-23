@@ -18,6 +18,6 @@ If Bluetooth is switched on but stops discovering devices, disconnect active Blu
 
 ## Recovery and replay
 
-Choose **Advanced options for Ubuntu** in GRUB to boot the generic kernel. From a desktop session, run `./setup --rollback wireless`, `./setup --rollback scroll`, or `./setup --rollback kernel` to undo that feature. Boot the generic kernel before removing the T2 image. The installer preserves a previously installed T2 image.
+For generic-kernel recovery, have a wired USB keyboard and a USB-C adapter if needed. The stock generic kernels tested on this model lack the T2 bridge driver for the built-in keyboard. Choose **Advanced options for Ubuntu** in GRUB to boot the generic kernel. From a desktop session, run `./setup --rollback wireless`, `./setup --rollback scroll`, or `./setup --rollback kernel` to undo that feature. Boot the generic kernel before removing the T2 image. The installer preserves a previously installed T2 image.
 
 The install saves `~/.local/state/ubuntu-mbpro/manifest.json` by default. Keep a copy, check out its MacBook commit, then run `./setup --replay /path/to/manifest.json` in the new desktop session. The manifest pins setup repositories and the T2 kernel. Ubuntu packages and Snap applications follow their configured channels.
