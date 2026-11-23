@@ -96,6 +96,12 @@ def main():
         own = revision(run('git','-C',ROOT,'rev-parse','HEAD',capture_output=True).stdout.strip())
         if run('git','-C',ROOT,'status','--porcelain','--untracked-files=no',capture_output=True).stdout:
             parser.exit(1,'Use a clean MacBook installer checkout so the manifest can replay it.\n')
+        if opts['scroll'] is None and not args.replay and SCROLL_UNIT.exists():
+            setting = re.search(r'^Environment=MACBOOK_FINGER_SCROLL_PERCENT=([0-9]+)$',
+                                SCROLL_UNIT.read_text(), re.MULTILINE)
+            if setting is None:
+                parser.exit(1,'Review the existing MacBook scroll setting before recording its value.\n')
+            opts['scroll'] = int(setting[1])
         pins = {}
         if args.replay:
             old = json.loads(args.replay.read_text())
