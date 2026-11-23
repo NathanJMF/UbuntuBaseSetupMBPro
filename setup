@@ -1,0 +1,141 @@
+#!/usr/bin/python3 -I
+"""Build or replay a MacBookPro15,4 desktop from the public repositories."""
+import argparse
+from contextlib import contextmanager
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import platform
+import subprocess
+import tempfile
+
+ROOT = Path(__file__).resolve().parent
+STATE = Path(os.environ.get('XDG_STATE_HOME', Path.home()/'.local/state')) / 'ubuntu-mbpro'
+CONFIG = Path(os.environ.get('XDG_CONFIG_HOME', Path.home()/'.config'))
+LIB = Path.home()/'.local/lib/ubuntu-mbpro'
+SCROLL_UNIT = CONFIG/'systemd/user/org.gnome.Shell@ubuntu.service.d/85-ubuntu-mbpro-scroll.conf'
+REPOS = {'base':'UbuntuBaseSetup', 'thermal':'UbuntuThermals'}
+ABI = '7.3.5-1-t2-resolute'
+
+
+def run(*args, **options):
+    return subprocess.run(args, check=True, text=True, **options)
+
+
+def revision(value):
+    if not isinstance(value,str) or not re.fullmatch('[0-9a-f]{40}',value):
+        raise ValueError('Expected a full Git commit ID.')
+    return value
+
+
+@contextmanager
+def checkout(key, requested):
+    repo = 'https://github.com/NathanJMF/' + REPOS[key] + '.git'
+    with tempfile.TemporaryDirectory() as temp:
+        path = Path(temp)
+        run('git','-C',path,'init','--quiet')
+        run('git','-C',path,'fetch','--quiet','--depth=1',repo,revision(requested) if requested else 'refs/heads/main')
+        run('git','-C',path,'checkout','--quiet','--detach','FETCH_HEAD')
+        actual = revision(run('git','-C',path,'rev-parse','HEAD',capture_output=True).stdout.strip())
+        if requested and actual != requested:
+            raise RuntimeError('Dependency revision mismatch.')
+        yield path, actual
+
+
+def scroll(percent):
+    if percent is None:
+        SCROLL_UNIT.unlink(missing_ok=True)
+        (LIB/'scroll.so').unlink(missing_ok=True)
+    else:
+        if type(percent) != int or not 1 <= percent <= 200:
+            raise ValueError('Scroll percentage must be between 1 and 200.')
+        run('sudo','apt-get','install','-y','libinput-dev','gcc')
+        LIB.mkdir(parents=True,exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=LIB) as tmp:
+            so = Path(tmp)/'scroll.so'
+            run('cc','-Wall','-Wextra','-Werror','-O2','-shared','-fPIC',ROOT/'scroll/scroll.c','-ldl','-o',so)
+            so.replace(LIB/'scroll.so')
+        SCROLL_UNIT.parent.mkdir(parents=True,exist_ok=True)
+        SCROLL_UNIT.write_text('[Service]\nEnvironment="LD_PRELOAD=%h/.local/lib/ubuntu-mbpro/scroll.so"\n'
+                               f'Environment=MACBOOK_FINGER_SCROLL_PERCENT={percent}\n')
+    run('systemctl','--user','daemon-reload')
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--nightfall',action='store_true')
+    parser.add_argument('--lock-after-15-minutes',action='store_true')
+    parser.add_argument('--scroll',type=int,metavar='1..200')
+    parser.add_argument('--replay',type=Path,metavar='MANIFEST')
+    parser.add_argument('--rollback',choices=['scroll','wireless','kernel'])
+    args = parser.parse_args()
+    if args.scroll is not None and not 1 <= args.scroll <= 200:
+        parser.error('Scroll percentage must be between 1 and 200.')
+    model = Path('/sys/class/dmi/id/product_name')
+    if not model.is_file() or model.read_text().strip() != 'MacBookPro15,4':
+        parser.exit(1,'This installer supports the 2019 MacBookPro15,4 only.\n')
+    if os.getuid() == 0 or not os.environ.get('DBUS_SESSION_BUS_ADDRESS'):
+        parser.exit(1,'Run setup in your GNOME desktop session as your regular user.\n')
+    opts = dict(nightfall=args.nightfall,lock=args.lock_after_15_minutes,scroll=args.scroll)
+    if (args.rollback or args.replay) and (any(value is not None and value is not False for value in opts.values()) or (args.rollback and args.replay)):
+        parser.error('Use replay or rollback on its own.')
+    STATE.mkdir(mode=0o700,parents=True,exist_ok=True)
+    with (STATE/'install.lock').open('a') as lock:
+        fcntl.flock(lock,fcntl.LOCK_EX)
+        if args.rollback:
+            if args.rollback == 'scroll':
+                scroll(None)
+            else:
+                run('sudo','/usr/bin/python3','-I',ROOT/'hardware.py',args.rollback,'--rollback')
+            return
+        release = platform.freedesktop_os_release()
+        if release.get('ID') != 'ubuntu' or release.get('VERSION_CODENAME') != 'resolute':
+            parser.exit(1,'The tested kernel package targets Ubuntu 26.04 Resolute.\n')
+        own = revision(run('git','-C',ROOT,'rev-parse','HEAD',capture_output=True).stdout.strip())
+        if run('git','-C',ROOT,'status','--porcelain','--untracked-files=no',capture_output=True).stdout:
+            parser.exit(1,'Use a clean MacBook installer checkout so the manifest can replay it.\n')
+        pins = {}
+        if args.replay:
+            old = json.loads(args.replay.read_text())
+            if old['schema'] != 1 or old['commits']['macbook'] != own or old['kernel'] != ABI:
+                parser.exit(1,'Check out the MacBook commit named in the manifest before replay.\n')
+            opts = old['options']
+            pins = old['commits']
+            for key in ('base','thermal','resources','keeper'):
+                revision(pins[key])
+            if opts['nightfall']:
+                revision(pins['nightfall'])
+        if any(type(opts[k]) is not bool for k in ('nightfall','lock')) or (opts['scroll'] is not None and (type(opts['scroll']) != int or not 1 <= opts['scroll'] <= 200)):
+            parser.error('Invalid profile options.')
+        commits = {'macbook':own}
+        with checkout('base',pins.get('base')) as (base,commits['base']), checkout('thermal',pins.get('thermal')) as (thermal,commits['thermal']):
+            flags = (['--nightfall'] if opts['nightfall'] else []) + (['--lock-after-15-minutes'] if opts['lock'] else [])
+            env = os.environ.copy()
+            for key, variable in [('nightfall','UBUNTU_NIGHTFALL_REVISION'),('resources','UBUNTU_RESOURCES_REVISION'),('keeper','UBUNTU_KEEPER_REVISION')]:
+                if key in pins:
+                    env[variable] = revision(pins[key])
+                else:
+                    env.pop(variable,None)
+            run(base/'setup',*flags,env=env)
+            base_state = STATE.parent/'ubuntu-desktop-setup'
+            for key in ['resources','keeper'] + (['nightfall'] if opts['nightfall'] else []):
+                commits[key] = revision((base_state/(key+'-revision')).read_text().strip())
+                if key in pins and commits[key] != pins[key]:
+                    raise RuntimeError(f'Installed {key} revision differs from the manifest.')
+            run('sudo','/usr/bin/python3','-I',ROOT/'hardware.py','kernel')
+            run('sudo','/usr/bin/python3','-I',ROOT/'hardware.py','wireless')
+            run(thermal/'install')
+            if opts['scroll'] is not None or args.replay:
+                scroll(opts['scroll'])
+        manifest = dict(schema=1, model='MacBookPro15,4', ubuntu=release['VERSION_ID'],
+                        kernel=ABI, running_kernel=os.uname().release, commits=commits, options=opts)
+        tmp = STATE/'manifest.new'
+        tmp.write_text(json.dumps(manifest,indent=2)+'\n')
+        tmp.replace(STATE/'manifest.json')
+        print(f'Installation recorded in {STATE}/manifest.json. Reboot when ready.')
+
+
+if __name__ == '__main__':
+    main()

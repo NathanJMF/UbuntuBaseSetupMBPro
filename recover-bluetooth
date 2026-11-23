@@ -1,0 +1,26 @@
+#!/bin/sh
+# Explicit recovery for a powered BCM4377 that has stopped discovering devices.
+set -eu
+[ "$(id -u)" -eq 0 ] || { echo 'Run sudo ./recover-bluetooth.' >&2; exit 1; }
+grep -Fxq MacBookPro15,4 /sys/class/dmi/id/product_name
+slot=0000:01:00.1
+device=/sys/bus/pci/devices/$slot
+driver=/sys/bus/pci/drivers/hci_bcm4377
+grep -Fxq 0x14e4 "$device/vendor"
+grep -Fxq 0x5fa0 "$device/device"
+grep -Fxq flr "$device/reset_method" || { echo 'Bluetooth-only function reset unavailable.' >&2; exit 1; }
+if [ -L "$device/driver" ]; then
+    [ -L "$driver/$slot" ] || exit 1
+    connections=$(timeout 5 bluetoothctl devices Connected)
+    [ -z "$connections" ] || { echo 'Disconnect Bluetooth devices before recovering discovery.' >&2; exit 1; }
+    printf '%s' "$slot" > "$driver/unbind"
+fi
+reattach() {
+    if [ ! -L "$device/driver" ]; then printf '%s' "$slot" > "$driver/bind"; fi
+}
+trap reattach EXIT
+printf 1 > "$device/reset"
+sleep 1
+reattach
+trap - EXIT
+echo 'Bluetooth controller reattached. Open Bluetooth Settings to scan.'

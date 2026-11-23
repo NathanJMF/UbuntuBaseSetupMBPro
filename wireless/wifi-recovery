@@ -1,0 +1,147 @@
+#!/usr/bin/python3 -I
+"""Recover this Mac's Wi-Fi function after repeated Broadcom firmware scan errors."""
+from collections import deque
+from pathlib import Path
+import fcntl
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+ADDRESS = '0000:01:00.0'
+DEVICE = Path('/sys/bus/pci/devices') / ADDRESS
+DRIVER = Path('/sys/bus/pci/drivers/brcmfmac')
+STATE = Path('/run/macbook-bcm4377-recovery')
+SELF = '/usr/local/libexec/macbook-bcm4377-recovery'
+PREFIX = r'^ieee80211 (phy[0-9]+): '
+FAULT = (r'brcmf_msgbuf_query_dcmd: Timeout on response for query command'
+         r'|brcmf_msgbuf_tx_ioctl: Failed to reserve space in commonring')
+SCAN = r'brcmf_cfg80211_scan: scan error \(-(5|12)\)'
+PATTERN = PREFIX + '(' + FAULT + '|' + SCAN + ')$'
+os.environ['LC_ALL'] = 'C'
+
+
+def value(path):
+    return path.read_text().strip()
+
+
+def query(*args):
+    return subprocess.check_output(args, text=True, timeout=8).strip()
+
+
+def eligible(phy):
+    if (value(Path('/sys/class/dmi/id/product_name')) != 'MacBookPro15,4'
+            or value(DEVICE/'vendor') != '0x14e4' or value(DEVICE/'device') != '0x4488'
+            or (DEVICE/'driver').resolve() != DRIVER or not (DEVICE/'ieee80211'/phy).is_dir()
+            or value(DEVICE/'power_state') != 'D0'
+            or Path('/run/macbook-bcm4377-suspend').exists()):
+        return False
+    if query('/usr/bin/busctl', 'get-property', 'org.freedesktop.login1',
+             '/org/freedesktop/login1', 'org.freedesktop.login1.Manager', 'PreparingForSleep') != 'b false':
+        return False
+    interfaces = list((DEVICE/'net').iterdir())
+    if len(interfaces) != 1:
+        return False
+    name = interfaces[0].name
+    state = query('/usr/bin/nmcli', '-g', 'GENERAL.STATE', 'device', 'show', name).split()[0]
+    return (state in {'30', '120'} and query('/usr/bin/nmcli', 'radio', 'wifi') == 'enabled'
+            and query('/usr/sbin/iw', 'dev', name, 'link') == 'Not connected.')
+
+
+def allowed(attempts, now):
+    return (not any(now - t < 600 for t in attempts)
+            and sum(now - t < 3600 for t in attempts) < 2)
+
+
+def recover(phy):
+    STATE.mkdir(mode=0o700, exist_ok=True)
+    with (STATE/'lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        now = time.monotonic()
+        history = STATE/'attempts'
+        attempts = json.loads(history.read_text()) if history.exists() else []
+        if not allowed(attempts, now) or not eligible(phy):
+            return
+        control = DEVICE/'power/control'
+        original = value(control)
+        try:
+            if original != 'on':
+                control.write_text('on')
+            if not eligible(phy):
+                return
+            recent = [t for t in attempts if now - t < 3600]
+            temp = STATE/'attempts.new'
+            temp.write_text(json.dumps(recent + [now]))
+            temp.replace(history)
+            print(f'Resetting disconnected Broadcom Wi-Fi {ADDRESS} ({phy})', flush=True)
+            (DRIVER/'unbind').write_text(ADDRESS)
+            for _ in range(30):
+                if value(DEVICE/'power_state') == 'D0':
+                    break
+                time.sleep(0.1)
+            else:
+                raise RuntimeError('Wi-Fi did not return to D0. Skipped PCI bind.')
+            (DRIVER/'bind').write_text(ADDRESS)
+            if (DEVICE/'driver').resolve() != DRIVER:
+                raise RuntimeError('Wi-Fi driver failed to reattach')
+            print('Reattached Broadcom Wi-Fi driver', flush=True)
+        finally:
+            if original != 'on':
+                control.write_text(original)
+
+
+class Evidence:
+    def __init__(self):
+        self.phy = None
+        self.scans = deque(maxlen=16)
+        self.last_fault = None
+
+    def feed(self, message, stamp):
+        match = re.fullmatch(PATTERN, message)
+        if not match:
+            return None
+        phy = match[1]
+        if phy != self.phy:
+            self.scans.clear()
+            self.last_fault = None
+            self.phy = phy
+        if match[3] is None:
+            self.last_fault = stamp
+        else:
+            self.scans.append(stamp)
+            if (self.last_fault is not None and 0 <= stamp - self.last_fault <= 90
+                    and any(0.5 <= stamp - prev <= 90 for prev in self.scans)):
+                return phy
+        return None
+
+
+def watch():
+    events = Evidence()
+    next_check = 0
+    command = ['/usr/bin/journalctl', '--dmesg', '--boot', '--follow', '--lines=0',
+               '--no-pager', '--output=json', '--output-fields=MESSAGE', '--grep='+PATTERN]
+    with subprocess.Popen(command, stdout=subprocess.PIPE, text=True) as stream:
+        for line in stream.stdout:
+            entry = json.loads(line)
+            stamp = int(entry['__MONOTONIC_TIMESTAMP']) / 1_000_000
+            now = time.monotonic()
+            if now - stamp > 15:
+                continue
+            phy = events.feed(entry['MESSAGE'], stamp)
+            if phy and now >= next_check and (DEVICE/'ieee80211'/phy).is_dir():
+                next_check = now + 12
+                subprocess.run(['/usr/bin/systemd-inhibit', '--what=sleep', '--mode=block',
+                                '--who=MacBook Wi-Fi recovery', '--why=Reattaching Wi-Fi firmware',
+                                SELF, 'recover', phy], check=False)
+    raise RuntimeError('Kernel journal stream ended')
+
+
+if __name__ == '__main__':
+    if sys.argv[1:] == ['watch']:
+        watch()
+    elif len(sys.argv) == 3 and sys.argv[1] == 'recover' and re.fullmatch(r'phy[0-9]+', sys.argv[2]):
+        recover(sys.argv[2])
+    else:
+        sys.exit('Expected watch or recover phyN')

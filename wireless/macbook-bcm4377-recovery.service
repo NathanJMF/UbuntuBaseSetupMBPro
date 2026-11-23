@@ -1,0 +1,17 @@
+[Unit]
+Description=Recover MacBook Wi-Fi after repeated Broadcom firmware scan failures
+After=NetworkManager.service systemd-journald.service
+ConditionPathExists=/sys/bus/pci/devices/0000:01:00.0
+
+[Service]
+ExecStart=/usr/local/libexec/macbook-bcm4377-recovery watch
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectSystem=full
+PrivateTmp=yes
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

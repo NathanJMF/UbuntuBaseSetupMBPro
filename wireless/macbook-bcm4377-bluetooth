@@ -1,0 +1,47 @@
+#!/bin/sh
+set -eu
+
+slot=0000:01:00.1
+device=/sys/bus/pci/devices/$slot
+driver=/sys/bus/pci/drivers/hci_bcm4377
+marker=/run/macbook-bcm4377-suspend/bluetooth
+
+grep -Fxq MacBookPro15,4 /sys/class/dmi/id/product_name || exit 0
+[ -d /sys/module/t2bce_core ] || exit 0
+[ -d "$device" ] || exit 0
+grep -Fxq 0x14e4 "$device/vendor" || exit 0
+grep -Fxq 0x5fa0 "$device/device" || exit 0
+
+case ${1-} in
+    prepare)
+        [ -L "$driver/$slot" ] || exit 0
+        for controller in "$device"/bluetooth/hci*; do
+            [ -d "$controller" ] || exit 0
+            powered=$(busctl --system --timeout=2s get-property org.bluez \
+                "/org/bluez/${controller##*/}" org.bluez.Adapter1 Powered) || exit 0
+            [ "$powered" = 'b true' ] || exit 0
+        done
+        # Record ownership before detaching so cleanup also runs on partial failure.
+        : > "$marker"
+        printf '%s' "$slot" > "$driver/unbind"
+        echo 'BCM4377 Bluetooth detached before suspend'
+        ;;
+    restore)
+        [ -f "$marker" ] || exit 0
+        [ ! -L "$device/driver" ] || exit 0
+        # Use only a function-level reset. The adjacent PCI function provides Wi-Fi.
+        if grep -Fxq flr "$device/reset_method"; then
+            if printf 1 > "$device/reset"; then
+                sleep 1
+            else
+                echo 'BCM4377 Bluetooth function reset failed, attempting driver reattach' >&2
+            fi
+        fi
+        printf '%s' "$slot" > "$driver/bind"
+        rm -f "$marker"
+        echo 'BCM4377 Bluetooth reattached after suspend attempt'
+        ;;
+    *)
+        exit 2
+        ;;
+esac

@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+case "${1:-}" in prereqs) exit 0;; esac
+case "${version:-}" in *-t2-resolute) ;; *) exit 0;; esac
+. /usr/share/initramfs-tools/hook-functions
+for driver in t2bce_dma t2bce_core t2bce_vhci; do force_load "$driver"; done

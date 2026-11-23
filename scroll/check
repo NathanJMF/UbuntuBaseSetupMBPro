@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+cd "$(dirname "$0")"
+dir=$(mktemp -d)
+trap 'rm -rf -- "$dir"' EXIT
+cc -Wall -Wextra -Werror -fPIC -shared fixture.c -o "$dir/libfixture.so"
+cc -Wall -Wextra -Werror check.c -L"$dir" -Wl,-rpath,"$dir" -lfixture -o "$dir/check"
+cc -Wall -Wextra -Werror -shared -fPIC scroll.c -ldl -o "$dir/scroll.so"
+MACBOOK_FINGER_SCROLL_PERCENT=15 LD_PRELOAD="$dir/scroll.so" "$dir/check"
